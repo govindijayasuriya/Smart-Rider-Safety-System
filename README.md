@@ -160,11 +160,11 @@ combined to estimate a possible dog-related hazard.
 
 ### Basic flow
 
-Radar ───────────────┐
-                     │
-Microphone → Audio ML ├──→ Sensor Fusion → Rider Warning
-                     │
-IMU → Crash Logic ───┘
+Radar   ───────────────┐
+                       │
+Microphone → Audio ML  ├──→ Sensor Fusion → Rider Warning
+                       │
+IMU → Crash Logic   ───┘
 
 Crash → Countdown → Cancel / Emergency Alert
 
@@ -289,10 +289,11 @@ Current stage:
 
 Team members:
 
-1. Jayasuriya M.G.S.F
-2. Jayasekara J.M.O.S
-3. Kumaranayaka K.I.S
-4. 
+1. Sewmini D.B.Y.L
+2. Jayasuriya M.G.S.F
+3. Jayasekara J.M.O.S
+4. Kumaranayaka K.I.S
+
 
 University of Ruhuna
 Faculty of Engineering
