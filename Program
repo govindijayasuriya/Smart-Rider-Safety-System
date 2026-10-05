@@ -1,0 +1,405 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
+
+#define TRIG1 5
+#define ECHO1 18
+
+#define SOUND_PIN 34
+#define BUZZER_PIN 25
+#define VIBRATION_PIN 26
+#define BUTTON_PIN 27
+
+#define SDA_PIN 22
+#define SCL_PIN 23
+
+#define PROXIMITY_LIMIT 300.0
+#define SOUND_THRESHOLD 3000
+#define DETERRENT_DURATION 3000
+#define TILT_LIMIT 60.0
+#define CRASH_COUNTDOWN 10000
+#define DOUBLE_PRESS_TIME 500
+
+Adafruit_MPU6050 mpu;
+
+bool deterrentActive = false;
+bool crashDetected = false;
+bool emergencyActive = false;
+
+unsigned long deterrentStartTime = 0;
+unsigned long crashStartTime = 0;
+unsigned long lastButtonPress = 0;
+
+bool lastButtonState = HIGH;
+bool waitingForSecondPress = false;
+
+// =====================================================
+// ULTRASONIC DISTANCE
+// =====================================================
+
+float getDistance(int trigPin, int echoPin)
+{
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+
+  if (duration == 0)
+    return 999.0;
+
+  return duration * 0.0343 / 2.0;
+}
+
+// =====================================================
+// START DETERRENT
+// =====================================================
+
+void startDeterrent()
+{
+  if (!deterrentActive)
+  {
+    deterrentActive = true;
+    deterrentStartTime = millis();
+
+    digitalWrite(VIBRATION_PIN, HIGH);
+    tone(BUZZER_PIN, 22000);
+
+    Serial.println("DETERRENT ACTIVATED");
+  }
+}
+
+// =====================================================
+// STOP DETERRENT
+// =====================================================
+
+void stopDeterrent()
+{
+  deterrentActive = false;
+
+  digitalWrite(VIBRATION_PIN, LOW);
+  noTone(BUZZER_PIN);
+
+  Serial.println("DETERRENT OFF");
+}
+
+// =====================================================
+// CANCEL CRASH
+// =====================================================
+
+void cancelCrash()
+{
+  crashDetected = false;
+
+  noTone(BUZZER_PIN);
+  digitalWrite(VIBRATION_PIN, LOW);
+
+  Serial.println("CRASH ALERT CANCELLED");
+}
+
+// =====================================================
+// BUTTON
+// =====================================================
+
+void handleButton()
+{
+  bool buttonState = digitalRead(BUTTON_PIN);
+
+  if (lastButtonState == HIGH && buttonState == LOW)
+  {
+    unsigned long currentTime = millis();
+
+    // Cancel crash alert
+    if (crashDetected && !emergencyActive)
+    {
+      cancelCrash();
+      waitingForSecondPress = false;
+
+      lastButtonState = buttonState;
+      return;
+    }
+
+    // Emergency active
+    if (emergencyActive)
+    {
+      lastButtonState = buttonState;
+      return;
+    }
+
+    // Double press = manual deterrent
+    if (waitingForSecondPress &&
+        currentTime - lastButtonPress <= DOUBLE_PRESS_TIME)
+    {
+      startDeterrent();
+      waitingForSecondPress = false;
+    }
+    else
+    {
+      waitingForSecondPress = true;
+      lastButtonPress = currentTime;
+    }
+  }
+
+  if (waitingForSecondPress &&
+      millis() - lastButtonPress > DOUBLE_PRESS_TIME)
+  {
+    waitingForSecondPress = false;
+  }
+
+  lastButtonState = buttonState;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(TRIG1, OUTPUT);
+  pinMode(ECHO1, INPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(VIBRATION_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(VIBRATION_PIN, LOW);
+  noTone(BUZZER_PIN);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!mpu.begin())
+  {
+    Serial.println("MPU6050 NOT DETECTED!");
+
+    while (1)
+    {
+      delay(100);
+    }
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+
+  Serial.println("================================");
+  Serial.println("SRSHMS SYSTEM READY");
+  Serial.println("================================");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // ===================================================
+  // BUTTON
+  // ===================================================
+
+  handleButton();
+
+  // ===================================================
+  // ULTRASONIC
+  // ===================================================
+
+  float distance1 = getDistance(TRIG1, ECHO1);
+
+  // ===================================================
+  // SOUND
+  // ===================================================
+
+  int soundValue = analogRead(SOUND_PIN);
+
+  // ===================================================
+  // HAZARD DETECTION
+  // ===================================================
+
+  bool objectDetected =
+      distance1 < PROXIMITY_LIMIT;
+
+  bool loudSoundDetected =
+      soundValue > SOUND_THRESHOLD;
+
+  if (objectDetected &&
+      loudSoundDetected &&
+      !crashDetected &&
+      !emergencyActive)
+  {
+    startDeterrent();
+  }
+
+  // ===================================================
+  // DETERRENT TIMER
+  // ===================================================
+
+  if (deterrentActive)
+  {
+    if (millis() - deterrentStartTime >=
+        DETERRENT_DURATION)
+    {
+      stopDeterrent();
+    }
+  }
+
+  // ===================================================
+  // MPU6050
+  // ===================================================
+
+  sensors_event_t acceleration;
+  sensors_event_t gyro;
+  sensors_event_t temperature;
+
+  mpu.getEvent(
+    &acceleration,
+    &gyro,
+    &temperature
+  );
+
+  float ax = acceleration.acceleration.x;
+  float ay = acceleration.acceleration.y;
+  float az = acceleration.acceleration.z;
+
+  // ===================================================
+  // CALCULATE ROLL AND PITCH
+  // ===================================================
+
+  float roll =
+      atan2(ay, az) * 180.0 / PI;
+
+  float pitch =
+      atan2(
+        -ax,
+        sqrt(ay * ay + az * az)
+      ) * 180.0 / PI;
+
+  // ===================================================
+  // FALL DETECTION
+  // ONLY ANGLE IS USED
+  // ===================================================
+
+  bool fallDetected =
+      abs(roll) > TILT_LIMIT ||
+      abs(pitch) > TILT_LIMIT;
+
+  // ===================================================
+  // START CRASH ALERT
+  // ===================================================
+
+  if (!crashDetected &&
+      !emergencyActive &&
+      fallDetected)
+  {
+    crashDetected = true;
+    crashStartTime = millis();
+
+    if (deterrentActive)
+    {
+      stopDeterrent();
+    }
+
+    Serial.println();
+    Serial.println("****************************************");
+    Serial.println("           FALL DETECTED");
+    Serial.println("****************************************");
+  }
+
+  // ===================================================
+  // STOP ALERT WHEN ANGLE RETURNS NORMAL
+  // ===================================================
+
+  if (crashDetected &&
+      !emergencyActive &&
+      !fallDetected)
+  {
+    crashDetected = false;
+
+    noTone(BUZZER_PIN);
+    digitalWrite(VIBRATION_PIN, LOW);
+
+    Serial.println("ANGLE NORMAL - ALERT STOPPED");
+  }
+
+  // ===================================================
+  // CRASH COUNTDOWN
+  // ===================================================
+
+  if (crashDetected &&
+      !emergencyActive)
+  {
+    unsigned long elapsed =
+        millis() - crashStartTime;
+
+    if (elapsed < CRASH_COUNTDOWN)
+    {
+      // Warning beep
+      if ((millis() / 500) % 2 == 0)
+      {
+        tone(BUZZER_PIN, 2000);
+      }
+      else
+      {
+        noTone(BUZZER_PIN);
+      }
+
+      static unsigned long lastPrint = 0;
+
+      if (millis() - lastPrint >= 1000)
+      {
+        lastPrint = millis();
+
+        unsigned long remaining =
+            (CRASH_COUNTDOWN - elapsed) / 1000;
+
+        Serial.print("Emergency alert in ");
+        Serial.print(remaining);
+        Serial.println(" seconds");
+      }
+    }
+    else
+    {
+      crashDetected = false;
+      emergencyActive = true;
+
+      Serial.println();
+      Serial.println("****************************************");
+      Serial.println("          EMERGENCY ALERT");
+      Serial.println("****************************************");
+    }
+  }
+
+  // ===================================================
+  // EMERGENCY MODE
+  // ===================================================
+
+  if (emergencyActive)
+  {
+    tone(BUZZER_PIN, 2500);
+    digitalWrite(VIBRATION_PIN, HIGH);
+  }
+
+  // ===================================================
+  // SERIAL MONITOR
+  // ===================================================
+
+  Serial.print("D1: ");
+  Serial.print(distance1);
+
+  Serial.print(" cm | Sound: ");
+  Serial.print(soundValue);
+
+  Serial.print(" | Roll: ");
+  Serial.print(roll);
+
+  Serial.print(" | Pitch: ");
+  Serial.print(pitch);
+
+  Serial.println();
+
+  delay(50);
+}
