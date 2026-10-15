@@ -1,0 +1,5 @@
+#pragma once
+
+const char* WIFI_SSID = "YOUR_PHONE_HOTSPOT";
+const char* WIFI_PASSWORD = "YOUR_HOTSPOT_PASSWORD";
+const char* PAIRING_TOKEN = "YOUR_PAIRING_TOKEN";
