@@ -1,90 +1,120 @@
-// ESP8266 NodeMCU bench firmware
-// MPU6050 SDA -> D3 / GPIO0
-// MPU6050 SCL -> D4 / GPIO2
-// Motor transistor control -> D7
-// Dog simulation input -> D5
-//
-// D5 -> 3V3 = dog detected
-// D5 -> GND = no dog
-// Never leave D5 floating or connect it to 5V.
-//
-// Accelerometer-only tilt: not validated for riding.
-// Motor must use a suitable driver/transistor circuit.
-
-// ESP8266 NodeMCU bench integration firmware.
-//
-// MPU6050: SDA D3, SCL D4, AD0 GND.
-// Motor driver: D7.
-// Dog simulation: D5 HIGH = dog, LOW = no dog.
-// Cancel button: D6 to GND, normally open.
-// Active 5V buzzer through a SEPARATE driver: D0.
-//
-// Never connect motor/buzzer loads directly to GPIO.
-// Accelerometer-only tilt: not validated for riding.
-
 #include <Arduino.h>
-#include <Wire.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include <math.h>
 #include "secrets.h"
 
-// ---------------- SETTINGS ----------------
+// ================= PINS =================
 
-constexpr uint8_t SENSOR = 0x68;
-constexpr uint8_t SDA_PIN = D3;
-constexpr uint8_t SCL_PIN = D4;
-constexpr uint8_t MOTOR_PIN = D7;
-constexpr uint8_t DOG_PIN = D5;
+constexpr uint8_t DOG_PIN    = D5;
+constexpr uint8_t BARK_PIN   = D1;
+constexpr uint8_t FALL_PIN   = D2;
+constexpr uint8_t MOTOR_PIN  = D7;
 constexpr uint8_t CANCEL_PIN = D6;
 constexpr uint8_t BUZZER_PIN = D0;
 
-constexpr float TILT_LIMIT = 60.0f;
-constexpr float UPRIGHT_LIMIT = 20.0f;
+// Inputs: HIGH = active.
+// External board must drive FALL_PIN HIGH for a fall.
+// Motor/buzzer pins control suitable drivers.
 
-constexpr uint32_t WINDOW_MS = 15000;
-constexpr uint32_t HOLD_MS = 300;
+// ================= SETTINGS =================
+
+constexpr uint32_t COUNTDOWN_MS = 15000;
 constexpr uint32_t REARM_MS = 2000;
 constexpr uint32_t DEBOUNCE_MS = 40;
 
+constexpr uint32_t DOG_WINDOW_MS = 3000;
+constexpr uint32_t CHASE_HOLD_MS = 1000;
+
 ESP8266WebServer server(80);
 
-// ---------------- STATE ----------------
+// ================= EVENT STATE =================
 
-String state = "UNCALIBRATED";
-String eventId, deviceId, bootId;
+String state = "ARMED";
+String eventId;
+String deviceId;
+String bootId;
 
 uint32_t eventCount = 0;
 uint32_t pendingAt = 0;
-uint32_t aboveAt = 0;
 uint32_t uprightAt = 0;
-uint32_t sampleAt = 0;
 uint32_t printAt = 0;
 
-bool above = false;
-bool upright = false;
-bool calibrated = false;
-bool sensorOk = false;
+bool uprightTiming = false;
 bool acknowledged = false;
 bool fsOk = false;
 
-float rx = 0, ry = 0, rz = 1, tilt = 0;
+// ================= INPUTS =================
 
-enum class VibrationMode { OFF, DOG, TILT };
-VibrationMode vibrationMode = VibrationMode::OFF;
+bool dogHigh = false;
+bool barkHigh = false;
+bool fallHigh = false;
 
-uint32_t patternStartedAt = 0;
-bool motorOn = false;
-bool buzzerOn = false;
-bool dogDetected = false;
+bool dogSeen = false;
+bool chasing = false;
+
+uint32_t lastDogAt = 0;
+uint32_t lastMatchAt = 0;
+
+// ================= BUTTON =================
 
 bool buttonRaw = HIGH;
 bool buttonStable = HIGH;
 uint32_t buttonChangedAt = 0;
 
-// ---------------- OUTPUTS ----------------
+// ================= OUTPUTS =================
+
+enum class MotorMode {
+  OFF,
+  DOG,
+  EMERGENCY
+};
+
+MotorMode motorMode = MotorMode::OFF;
+
+uint32_t patternAt = 0;
+
+bool motorOn = false;
+bool buzzerOn = false;
+
+// ================= INPUT PROCESSING =================
+
+void readInputs() {
+  uint32_t now = millis();
+
+  dogHigh = digitalRead(DOG_PIN) == HIGH;
+  barkHigh = digitalRead(BARK_PIN) == HIGH;
+  fallHigh = digitalRead(FALL_PIN) == HIGH;
+
+  if (dogHigh) {
+    dogSeen = true;
+    lastDogAt = now;
+  }
+
+  if (
+    dogSeen &&
+    !dogHigh &&
+    (uint32_t)(now - lastDogAt) > DOG_WINDOW_MS
+  ) {
+    dogSeen = false;
+  }
+
+  // Camera detection must precede or overlap bark.
+  // There is no waiting delay when both are active.
+  if (dogSeen && barkHigh) {
+    chasing = true;
+    lastMatchAt = now;
+
+  } else if (
+    chasing &&
+    (uint32_t)(now - lastMatchAt) >= CHASE_HOLD_MS
+  ) {
+    chasing = false;
+  }
+}
+
+// ================= OUTPUT CONTROL =================
 
 void setMotor(bool on) {
   motorOn = on;
@@ -96,107 +126,67 @@ void setBuzzer(bool on) {
   digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
 }
 
-void stopOutputs() {
-  vibrationMode = VibrationMode::OFF;
-  patternStartedAt = millis();
-  setMotor(false);
-  setBuzzer(false);
-}
-
 void updateOutputs() {
-  dogDetected = digitalRead(DOG_PIN) == HIGH;
+  MotorMode wanted = MotorMode::OFF;
 
-  bool activeEvent =
-      state == "PENDING" ||
-      (state == "CONFIRMED" && !acknowledged);
+  if (state == "PENDING" || state == "CONFIRMED") {
+    // Immediate vibration during countdown
+    // and continued vibration after confirmation.
+    wanted = MotorMode::EMERGENCY;
 
-  bool immediateTilt =
-      calibrated && sensorOk &&
-      state == "ARMED" && tilt > TILT_LIMIT;
-
-  VibrationMode wanted = VibrationMode::OFF;
-
-  if (activeEvent || immediateTilt) {
-    wanted = VibrationMode::TILT;
-  } else if (dogDetected) {
-    wanted = VibrationMode::DOG;
+  } else if (chasing) {
+    wanted = MotorMode::DOG;
   }
 
   uint32_t now = millis();
 
-  if (wanted != vibrationMode) {
-    vibrationMode = wanted;
-    patternStartedAt = now;
+  if (wanted != motorMode) {
+    motorMode = wanted;
+    patternAt = now;
   }
 
-  uint32_t elapsed = now - patternStartedAt;
+  uint32_t elapsed = now - patternAt;
 
-  if (vibrationMode == VibrationMode::TILT) {
-    setMotor((elapsed % 500UL) < 300UL);
-  } else if (vibrationMode == VibrationMode::DOG) {
+  if (motorMode == MotorMode::DOG) {
+    // Two short pulses per second.
     uint32_t phase = elapsed % 1000UL;
+
     setMotor(
-        phase < 120UL ||
-        (phase >= 240UL && phase < 360UL)
+      phase < 150UL ||
+      (phase >= 300UL && phase < 450UL)
     );
+
+  } else if (motorMode == MotorMode::EMERGENCY) {
+    // First pulse starts immediately.
+    setMotor((elapsed % 800UL) < 500UL);
+
   } else {
     setMotor(false);
   }
 
-  // Buzzer starts ONLY after countdown expires.
-  setBuzzer(state == "CONFIRMED" && !acknowledged);
+  // Buzzer follows the fall signal directly.
+  // Cancel does not override a HIGH fall signal.
+  setBuzzer(fallHigh);
 }
 
-// ---------------- SENSOR ----------------
-
-bool writeReg(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(SENSOR);
-  Wire.write(reg);
-  Wire.write(value);
-  return Wire.endTransmission() == 0;
-}
-
-int16_t signed16() {
-  uint16_t h = Wire.read();
-  uint16_t l = Wire.read();
-  return static_cast<int16_t>((h << 8) | l);
-}
-
-bool acceleration(float &x, float &y, float &z) {
-  Wire.beginTransmission(SENSOR);
-  Wire.write(0x3B);
-
-  if (Wire.endTransmission(false) != 0) return false;
-
-  if (Wire.requestFrom(SENSOR, (uint8_t)6) != 6) {
-    while (Wire.available()) Wire.read();
-    return false;
-  }
-
-  x = signed16() / 16384.0f;
-  y = signed16() / 16384.0f;
-  z = signed16() / 16384.0f;
-
-  float n = sqrtf(x*x + y*y + z*z);
-  return isfinite(n) && n > 0.1f;
-}
-
-// ---------------- STORAGE ----------------
+// ================= STORAGE =================
 
 bool persistEvent() {
   if (!fsOk) return false;
 
   JsonDocument d;
+
   d["state"] = state;
   d["eventId"] = eventId;
+  d["acknowledged"] = acknowledged;
 
   File f = LittleFS.open("/event.tmp", "w");
   if (!f) return false;
 
-  size_t n = serializeJson(d, f);
+  size_t written = serializeJson(d, f);
   f.close();
 
-  return n > 0 &&
+  return written > 0 &&
          LittleFS.rename("/event.tmp", "/event.json");
 }
 
@@ -204,18 +194,21 @@ bool removeStoredEvent() {
   if (fsOk && LittleFS.exists("/event.json")) {
     return LittleFS.remove("/event.json");
   }
+
   return true;
 }
 
-// ---------------- EVENT CONTROL ----------------
+// ================= EVENT LOGIC =================
 
 void updateDeadline() {
   if (
-      state == "PENDING" &&
-      (uint32_t)(millis() - pendingAt) >= WINDOW_MS
+    state == "PENDING" &&
+    (uint32_t)(millis() - pendingAt) >= COUNTDOWN_MS
   ) {
     state = "CONFIRMED";
     acknowledged = false;
+
+    updateOutputs();
 
     if (!persistEvent()) {
       Serial.println("WARNING: event persistence failed");
@@ -225,16 +218,14 @@ void updateDeadline() {
   }
 }
 
-// Returns false if persistent cancellation could not be saved.
-bool cancelCurrentEvent() {
-  if (state != "PENDING" &&
-      state != "CONFIRMED" &&
-      state != "CANCELLED") {
+bool cancelEvent() {
+  if (
+    state != "PENDING" &&
+    state != "CONFIRMED" &&
+    state != "CANCELLED"
+  ) {
     return true;
   }
-
-  // Stop local alarm immediately, even if storage later fails.
-  stopOutputs();
 
   if (!removeStoredEvent()) {
     Serial.println("Cancel failed: storage error");
@@ -242,11 +233,13 @@ bool cancelCurrentEvent() {
   }
 
   state = "CANCELLED";
-  acknowledged = false;
-  upright = false;
-  above = false;
+  uprightTiming = false;
 
-  Serial.println("CANCELLED - local alarm stopped");
+  // Stops fall vibration; dog vibration can still run
+  // if the separate chasing condition remains active.
+  updateOutputs();
+
+  Serial.println("CANCELLED");
   return true;
 }
 
@@ -260,39 +253,89 @@ void pollCancelButton() {
   }
 
   if (
-      (uint32_t)(now - buttonChangedAt) >= DEBOUNCE_MS &&
-      buttonStable != buttonRaw
+    (uint32_t)(now - buttonChangedAt) >= DEBOUNCE_MS &&
+    buttonStable != buttonRaw
   ) {
     buttonStable = buttonRaw;
 
     if (buttonStable == LOW) {
-      if (!cancelCurrentEvent()) {
-        // Event remains active if cancellation could not persist.
-        Serial.println("WARNING: cancellation not saved");
-      }
+      cancelEvent();
     }
   }
 }
 
-// ---------------- HTTP ----------------
+void processFall() {
+  uint32_t now = millis();
 
-void error(int code, const char *message) {
+  // No fall hold timer: start immediately.
+  if (
+    state == "ARMED" &&
+    fallHigh &&
+    buttonStable == HIGH
+  ) {
+    eventId = bootId + "-" + String(++eventCount);
+    state = "PENDING";
+    pendingAt = now;
+
+    acknowledged = false;
+    uprightTiming = false;
+
+    // Start motor before writing to flash.
+    updateOutputs();
+
+    if (!persistEvent()) {
+      Serial.println("WARNING: event persistence failed");
+    }
+
+    Serial.println("PENDING - immediate fall warning");
+  }
+
+  // Avoid repeatedly triggering the same tilted condition.
+  if (state == "CANCELLED") {
+    if (!fallHigh && buttonStable == HIGH) {
+      if (!uprightTiming) {
+        uprightTiming = true;
+        uprightAt = now;
+      }
+
+      if ((uint32_t)(now - uprightAt) >= REARM_MS) {
+        state = "ARMED";
+        eventId = "";
+        acknowledged = false;
+        uprightTiming = false;
+
+        Serial.println("ARMED again");
+      }
+
+    } else {
+      uprightTiming = false;
+    }
+  }
+}
+
+// ================= HTTP HELPERS =================
+
+void sendError(int code, const char* message) {
   JsonDocument d;
+
   d["error"] = message;
   d["state"] = state;
 
   String body;
   serializeJson(d, body);
+
   server.send(code, "application/json", body);
 }
 
 bool authorized() {
   if (
-      server.header("Authorization") ==
-      String("Bearer ") + PAIRING_TOKEN
-  ) return true;
+    server.header("Authorization") ==
+    String("Bearer ") + PAIRING_TOKEN
+  ) {
+    return true;
+  }
 
-  error(401, "unauthorized");
+  sendError(401, "unauthorized");
   return false;
 }
 
@@ -300,14 +343,14 @@ bool matchingEvent() {
   JsonDocument d;
 
   if (deserializeJson(d, server.arg("plain"))) {
-    error(400, "invalid_json");
+    sendError(400, "invalid_json");
     return false;
   }
 
   String id = d["eventId"] | "";
 
   if (id.isEmpty() || id != eventId) {
-    error(409, "event_mismatch");
+    sendError(409, "event_mismatch");
     return false;
   }
 
@@ -315,156 +358,57 @@ bool matchingEvent() {
 }
 
 void sendStatus() {
+  readInputs();
+  processFall();
   updateDeadline();
   updateOutputs();
 
   JsonDocument d;
+
   d["deviceId"] = deviceId;
   d["eventId"] = eventId;
   d["state"] = state;
-  d["tiltDeg"] = tilt;
 
-  uint32_t elapsed = (uint32_t)(millis() - pendingAt);
+  uint32_t elapsed = millis() - pendingAt;
+
   d["remainingMs"] =
-      state == "PENDING" && elapsed < WINDOW_MS
-          ? WINDOW_MS - elapsed : 0;
+    state == "PENDING" && elapsed < COUNTDOWN_MS
+      ? COUNTDOWN_MS - elapsed : 0;
 
-  d["fw"] = "iotrix-bench-1.4";
-  d["sensorOk"] = sensorOk;
-  d["calibrated"] = calibrated;
+  d["fw"] = "iotrix-immediate-fall-1.5";
+
+  d["dogDetected"] = dogHigh;
+  d["barkDetected"] = barkHigh;
+  d["chasing"] = chasing;
+  d["fallDetected"] = fallHigh;
+
+  // Digital inputs do not provide the actual angle
+  // or external sensor health.
+  d["tiltAvailable"] = false;
+  d["sensorHealthKnown"] = false;
+
+  // Legacy app compatibility fields only.
+  d["tiltDeg"] = 0; // Placeholder, not a measured angle.
+  d["calibrated"] = true;
+  d["sensorOk"] = true; // Not proof of external sensor health.
+
   d["storageOk"] = fsOk;
-  d["dogDetected"] = dogDetected;
+  d["acknowledged"] = acknowledged;
   d["motorOn"] = motorOn;
   d["buzzerOn"] = buzzerOn;
   d["cancelPressed"] = buttonStable == LOW;
 
   d["vibrationMode"] =
-      vibrationMode == VibrationMode::TILT ? "TILT" :
-      vibrationMode == VibrationMode::DOG ? "DOG" : "OFF";
+    motorMode == MotorMode::EMERGENCY ? "EMERGENCY" :
+    motorMode == MotorMode::DOG ? "DOG" : "OFF";
 
   String body;
   serializeJson(d, body);
+
   server.send(200, "application/json", body);
 }
 
-// ---------------- CALIBRATION ----------------
-
-bool calibrate() {
-  stopOutputs();
-
-  float sx = 0, sy = 0, sz = 0;
-
-  for (int i = 0; i < 100; i++) {
-    float x, y, z;
-
-    if (!acceleration(x, y, z)) {
-      sensorOk = false;
-      return false;
-    }
-
-    float n = sqrtf(x*x + y*y + z*z);
-    if (n < 0.75f || n > 1.25f) return false;
-
-    sx += x;
-    sy += y;
-    sz += z;
-    delay(10);
-  }
-
-  float n = sqrtf(sx*sx + sy*sy + sz*sz);
-  if (n < 1.0f) return false;
-
-  rx = sx/n;
-  ry = sy/n;
-  rz = sz/n;
-
-  calibrated = true;
-  sensorOk = true;
-  tilt = 0;
-  above = false;
-  upright = false;
-  acknowledged = false;
-  state = "ARMED";
-  eventId = "";
-
-  return true;
-}
-
-// ---------------- TILT SAMPLING ----------------
-
-void sample() {
-  float x, y, z;
-  sensorOk = acceleration(x, y, z);
-
-  if (!sensorOk) {
-    above = false;
-    upright = false;
-    return;
-  }
-
-  if (!calibrated) return;
-
-  float n = sqrtf(x*x + y*y + z*z);
-
-  tilt = acosf(constrain(
-      (x*rx + y*ry + z*rz)/n,
-      -1.0f, 1.0f
-  )) * 180.0f / PI;
-
-  uint32_t now = millis();
-
-  if (state == "ARMED") {
-    if (tilt > TILT_LIMIT) {
-      if (!above) {
-        above = true;
-        aboveAt = now;
-      }
-
-      if ((uint32_t)(now - aboveAt) >= HOLD_MS) {
-        eventId = bootId + "-" + String(++eventCount);
-        state = "PENDING";
-        pendingAt = now;
-        acknowledged = false;
-        above = false;
-        upright = false;
-
-        if (!persistEvent()) {
-          Serial.println("WARNING: event persistence failed");
-        }
-
-        Serial.println("PENDING - 15 second cancel window");
-      }
-    } else {
-      above = false;
-    }
-  }
-
-  if (
-      state == "CANCELLED" ||
-      (state == "CONFIRMED" && acknowledged)
-  ) {
-    // Release the button and return upright before rearming.
-    if (tilt < UPRIGHT_LIMIT && buttonStable == HIGH) {
-      if (!upright) {
-        upright = true;
-        uprightAt = now;
-      }
-
-      if ((uint32_t)(now - uprightAt) >= REARM_MS) {
-        state = "ARMED";
-        eventId = "";
-        above = false;
-        upright = false;
-        acknowledged = false;
-        Serial.println("ARMED again");
-      }
-    } else {
-      upright = false;
-    }
-  }
-}
-
-// ---------------- SETUP ----------------
+// ================= SETUP =================
 
 void setup() {
   digitalWrite(MOTOR_PIN, LOW);
@@ -474,30 +418,21 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
 
   pinMode(DOG_PIN, INPUT);
+  pinMode(BARK_PIN, INPUT);
+  pinMode(FALL_PIN, INPUT);
   pinMode(CANCEL_PIN, INPUT_PULLUP);
 
   buttonRaw = digitalRead(CANCEL_PIN);
-  // Start HIGH so a button held during boot is also detected.
   buttonStable = HIGH;
   buttonChangedAt = millis();
 
-  stopOutputs();
-
   Serial.begin(115200);
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
+  delay(200);
 
-  delay(300);
-
-  bool configured = writeReg(0x6B, 0);
-  delay(100);
-  configured = writeReg(0x6C, 0) && configured;
-  configured = writeReg(0x1C, 0) && configured;
-
-  Serial.println(
-      configured ? "Sensor configured: SDA D3, SCL D4" :
-                   "Sensor configuration failed"
-  );
+  Serial.println();
+  Serial.println("=== IOTRIX IMMEDIATE FALL 1.5 ===");
+  Serial.println("DOG D5 | BARK D1 | FALL D2");
+  Serial.println("MOTOR D7 | CANCEL D6 | BUZZER DRIVER D0");
 
   deviceId = "bike-" + String(ESP.getChipId(), HEX);
   fsOk = LittleFS.begin();
@@ -506,12 +441,14 @@ void setup() {
 
   if (fsOk) {
     File f = LittleFS.open("/boot.txt", "r");
+
     if (f) {
       bootSequence = f.parseInt();
       f.close();
     }
 
     f = LittleFS.open("/boot.txt", "w");
+
     if (f) {
       f.print(++bootSequence);
       f.close();
@@ -520,21 +457,26 @@ void setup() {
     }
 
     f = LittleFS.open("/event.json", "r");
+
     if (f) {
       JsonDocument d;
+
       if (!deserializeJson(d, f)) {
         eventId = String(d["eventId"] | "");
+
         if (!eventId.isEmpty()) {
           state = "CONFIRMED";
-          acknowledged = false;
+          acknowledged = d["acknowledged"] | false;
         }
       }
+
       f.close();
     }
   }
 
-  bootId = deviceId + "-" + String(bootSequence) +
-           "-" + String(micros(), HEX);
+  bootId =
+    deviceId + "-" + String(bootSequence) +
+    "-" + String(micros(), HEX);
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
@@ -551,19 +493,20 @@ void setup() {
     if (!authorized()) return;
 
     updateDeadline();
+
     if (!matchingEvent()) return;
 
-    if (state != "PENDING" &&
-        state != "CONFIRMED" &&
-        state != "CANCELLED") {
-      error(409, "not_pending");
+    if (
+      state != "PENDING" &&
+      state != "CONFIRMED" &&
+      state != "CANCELLED"
+    ) {
+      sendError(409, "not_pending");
       return;
     }
 
-    // Also permits silencing a confirmed event.
-    // An SMS already sent cannot be recalled.
-    if (!cancelCurrentEvent()) {
-      error(503, "storage_error");
+    if (!cancelEvent()) {
+      sendError(503, "storage_error");
       return;
     }
 
@@ -574,33 +517,27 @@ void setup() {
     if (!authorized()) return;
 
     updateDeadline();
+
     if (!matchingEvent()) return;
 
-    // App may acknowledge a message already in flight
-    // after the local button has cancelled the event.
     if (state == "CANCELLED") {
       sendStatus();
       return;
     }
 
     if (state != "CONFIRMED") {
-      error(409, "not_confirmed");
-      return;
-    }
-
-    if (!removeStoredEvent()) {
-      error(503, "storage_error");
+      sendError(409, "not_confirmed");
       return;
     }
 
     acknowledged = true;
-    upright = false;
 
-    if (!calibrated) {
-      state = "UNCALIBRATED";
-      eventId = "";
+    if (!persistEvent()) {
+      Serial.println("WARNING: acknowledgement not saved");
     }
 
+    // ACK records SMS handling.
+    // Cancel stops the emergency vibration.
     sendStatus();
   });
 
@@ -608,71 +545,77 @@ void setup() {
     if (!authorized()) return;
 
     updateDeadline();
+    readInputs();
 
     if (state == "PENDING" || state == "CONFIRMED") {
-      error(409, "not_armed");
+      sendError(409, "not_armed");
       return;
     }
 
-    if (!calibrate()) {
-      error(503, "keep_still_and_check_sensor");
+    if (fallHigh) {
+      sendError(409, "return_bike_upright");
       return;
     }
 
+    // External board measures the angle.
     sendStatus();
   });
 
   server.onNotFound([]() {
-    error(404, "not_found");
+    sendError(404, "not_found");
   });
 
   server.begin();
-
-  Serial.println("Motor D7 | Dog D5 | Cancel D6 | Buzzer D0");
-  Serial.println("Calibrate upright using the app.");
 }
 
-// ---------------- LOOP ----------------
+// ================= LOOP =================
 
 void loop() {
-  // Check physical cancellation before expiring countdown.
+  readInputs();
   pollCancelButton();
+
+  // Detect fall before servicing the next app request.
+  processFall();
   updateDeadline();
-  server.handleClient();
-
-  uint32_t now = millis();
-
-  if ((uint32_t)(now - sampleAt) >= 20UL) {
-    sampleAt = now;
-    sample();
-  }
-
   updateOutputs();
 
-  if ((uint32_t)(now - printAt) >= 2000UL) {
-    printAt = now;
+  server.handleClient();
+
+  if ((uint32_t)(millis() - printAt) >= 500UL) {
+    printAt = millis();
+
+    Serial.print("DOG(D5)=");
+    Serial.print(dogHigh ? "HIGH" : "LOW");
+
+    Serial.print(" | BARK(D1)=");
+    Serial.print(barkHigh ? "HIGH" : "LOW");
+
+    Serial.print(" | FALL(D2)=");
+    Serial.print(fallHigh ? "HIGH" : "LOW");
+
+    Serial.print(" | CHASING=");
+    Serial.print(chasing ? "YES" : "NO");
+
+    Serial.print(" | STATE=");
+    Serial.print(state);
+
+    Serial.print(" | MOTOR=");
+    Serial.print(motorOn ? "ON" : "OFF");
+
+    Serial.print(" | BUZZER=");
+    Serial.print(buzzerOn ? "HIGH" : "LOW");
+
+    Serial.print(" | CANCEL=");
+    Serial.print(buttonStable == LOW ? "PRESSED" : "RELEASED");
 
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("Board IP: ");
+      Serial.print(" | IP=");
       Serial.print(WiFi.localIP());
     } else {
-      Serial.print("WiFi disconnected");
+      Serial.print(" | WiFi disconnected");
     }
 
-    Serial.print(" | ");
-    Serial.print(state);
-    Serial.print(" | tilt: ");
-    Serial.print(tilt, 1);
-    Serial.print(" | sensor: ");
-    Serial.print(sensorOk ? "OK" : "ERROR");
-    Serial.print(" | dog: ");
-    Serial.print(dogDetected ? "YES" : "NO");
-    Serial.print(" | motor: ");
-    Serial.print(motorOn ? "ON" : "OFF");
-    Serial.print(" | buzzer: ");
-    Serial.print(buzzerOn ? "ON" : "OFF");
-    Serial.print(" | button: ");
-    Serial.println(buttonStable == LOW ? "PRESSED" : "RELEASED");
+    Serial.println();
   }
 
   yield();
