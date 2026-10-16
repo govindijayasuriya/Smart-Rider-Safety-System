@@ -14,9 +14,9 @@ constexpr uint8_t MOTOR_PIN  = D7;
 constexpr uint8_t CANCEL_PIN = D6;
 constexpr uint8_t BUZZER_PIN = D0;
 
-// Inputs: HIGH = active.
-// External board must drive FALL_PIN HIGH for a fall.
-// Motor/buzzer pins control suitable drivers.
+// Inputs: HIGH = active, valid 3.3V logic.
+// Cancel button: D6 to GND, active LOW.
+// Motor and buzzer outputs control driver circuits.
 
 // ================= SETTINGS =================
 
@@ -74,7 +74,6 @@ enum class MotorMode {
 MotorMode motorMode = MotorMode::OFF;
 
 uint32_t patternAt = 0;
-
 bool motorOn = false;
 bool buzzerOn = false;
 
@@ -100,8 +99,7 @@ void readInputs() {
     dogSeen = false;
   }
 
-  // Camera detection must precede or overlap bark.
-  // There is no waiting delay when both are active.
+  // Camera dog detection must precede or overlap bark.
   if (dogSeen && barkHigh) {
     chasing = true;
     lastMatchAt = now;
@@ -130,8 +128,8 @@ void updateOutputs() {
   MotorMode wanted = MotorMode::OFF;
 
   if (state == "PENDING" || state == "CONFIRMED") {
-    // Immediate vibration during countdown
-    // and continued vibration after confirmation.
+    // Immediate fall vibration during countdown,
+    // continuing after countdown expires.
     wanted = MotorMode::EMERGENCY;
 
   } else if (chasing) {
@@ -148,7 +146,6 @@ void updateOutputs() {
   uint32_t elapsed = now - patternAt;
 
   if (motorMode == MotorMode::DOG) {
-    // Two short pulses per second.
     uint32_t phase = elapsed % 1000UL;
 
     setMotor(
@@ -157,16 +154,21 @@ void updateOutputs() {
     );
 
   } else if (motorMode == MotorMode::EMERGENCY) {
-    // First pulse starts immediately.
     setMotor((elapsed % 800UL) < 500UL);
 
   } else {
     setMotor(false);
   }
 
-  // Buzzer follows the fall signal directly.
-  // Cancel does not override a HIGH fall signal.
-  setBuzzer(fallHigh);
+  // BUZZER:
+  // ARMED     -> OFF
+  // PENDING   -> OFF throughout the 15-second countdown
+  // CONFIRMED -> ON
+  // CANCELLED -> OFF
+  //
+  // Message ACK does not silence the buzzer.
+  // App Cancel or physical Cancel silences it.
+  setBuzzer(state == "CONFIRMED");
 }
 
 // ================= STORAGE =================
@@ -214,7 +216,9 @@ void updateDeadline() {
       Serial.println("WARNING: event persistence failed");
     }
 
-    Serial.println("CONFIRMED - app may send SMS");
+    Serial.println(
+      "CONFIRMED - buzzer ON; app may send SMS"
+    );
   }
 }
 
@@ -235,11 +239,11 @@ bool cancelEvent() {
   state = "CANCELLED";
   uprightTiming = false;
 
-  // Stops fall vibration; dog vibration can still run
-  // if the separate chasing condition remains active.
+  // Stops buzzer and fall vibration immediately.
+  // Separate chasing vibration can still operate.
   updateOutputs();
 
-  Serial.println("CANCELLED");
+  Serial.println("CANCELLED - buzzer OFF");
   return true;
 }
 
@@ -267,30 +271,32 @@ void pollCancelButton() {
 void processFall() {
   uint32_t now = millis();
 
-  // No fall hold timer: start immediately.
+  // No fall hold delay.
   if (
     state == "ARMED" &&
     fallHigh &&
     buttonStable == HIGH
   ) {
     eventId = bootId + "-" + String(++eventCount);
+
     state = "PENDING";
     pendingAt = now;
-
     acknowledged = false;
     uprightTiming = false;
 
-    // Start motor before writing to flash.
+    // Motor starts immediately; buzzer stays OFF.
     updateOutputs();
 
     if (!persistEvent()) {
       Serial.println("WARNING: event persistence failed");
     }
 
-    Serial.println("PENDING - immediate fall warning");
+    Serial.println(
+      "PENDING - vibration ON, buzzer OFF, 15s to cancel"
+    );
   }
 
-  // Avoid repeatedly triggering the same tilted condition.
+  // Return upright and release Cancel before rearming.
   if (state == "CANCELLED") {
     if (!fallHigh && buttonStable == HIGH) {
       if (!uprightTiming) {
@@ -375,22 +381,21 @@ void sendStatus() {
     state == "PENDING" && elapsed < COUNTDOWN_MS
       ? COUNTDOWN_MS - elapsed : 0;
 
-  d["fw"] = "iotrix-immediate-fall-1.5";
+  d["fw"] = "iotrix-countdown-buzzer-1.6";
 
   d["dogDetected"] = dogHigh;
   d["barkDetected"] = barkHigh;
   d["chasing"] = chasing;
   d["fallDetected"] = fallHigh;
 
-  // Digital inputs do not provide the actual angle
-  // or external sensor health.
+  // Digital inputs do not transmit actual angle or health.
   d["tiltAvailable"] = false;
   d["sensorHealthKnown"] = false;
 
   // Legacy app compatibility fields only.
   d["tiltDeg"] = 0; // Placeholder, not a measured angle.
   d["calibrated"] = true;
-  d["sensorOk"] = true; // Not proof of external sensor health.
+  d["sensorOk"] = true; // Not external sensor health proof.
 
   d["storageOk"] = fsOk;
   d["acknowledged"] = acknowledged;
@@ -430,7 +435,7 @@ void setup() {
   delay(200);
 
   Serial.println();
-  Serial.println("=== IOTRIX IMMEDIATE FALL 1.5 ===");
+  Serial.println("=== IOTRIX COUNTDOWN BUZZER 1.6 ===");
   Serial.println("DOG D5 | BARK D1 | FALL D2");
   Serial.println("MOTOR D7 | CANCEL D6 | BUZZER DRIVER D0");
 
@@ -456,6 +461,7 @@ void setup() {
       fsOk = false;
     }
 
+    // Recover an unfinished event after restart.
     f = LittleFS.open("/event.json", "r");
 
     if (f) {
@@ -536,8 +542,8 @@ void setup() {
       Serial.println("WARNING: acknowledgement not saved");
     }
 
-    // ACK records SMS handling.
-    // Cancel stops the emergency vibration.
+    // ACK records message handling.
+    // Buzzer and emergency vibration remain ON until Cancel.
     sendStatus();
   });
 
@@ -557,7 +563,7 @@ void setup() {
       return;
     }
 
-    // External board measures the angle.
+    // The external board measures the angle.
     sendStatus();
   });
 
@@ -574,7 +580,6 @@ void loop() {
   readInputs();
   pollCancelButton();
 
-  // Detect fall before servicing the next app request.
   processFall();
   updateDeadline();
   updateOutputs();
@@ -603,10 +608,12 @@ void loop() {
     Serial.print(motorOn ? "ON" : "OFF");
 
     Serial.print(" | BUZZER=");
-    Serial.print(buzzerOn ? "HIGH" : "LOW");
+    Serial.print(buzzerOn ? "ON" : "OFF");
 
     Serial.print(" | CANCEL=");
-    Serial.print(buttonStable == LOW ? "PRESSED" : "RELEASED");
+    Serial.print(
+      buttonStable == LOW ? "PRESSED" : "RELEASED"
+    );
 
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print(" | IP=");
